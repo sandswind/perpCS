@@ -230,3 +230,184 @@ func countByType(events []types.Event, t types.EventType) int {
 	}
 	return n
 }
+
+
+// ---- v0.2 user order tests ----
+
+// buildActorWithQueue creates an actor + order queue for user-order tests.
+// It uses a 5-minute replay window so tests run quickly.
+func buildActorWithQueue(t *testing.T) (*Actor, chan *UserOrder, *MemorySink) {
+	t.Helper()
+	orders := makeOrders(t, 5*time.Minute)
+	q := make(chan *UserOrder, 16)
+	sink := &MemorySink{}
+	cfg := Config{
+		Symbol:         "BTC-MED",
+		SessionID:      "user-order-test",
+		LevelID:        "D-312-BTC",
+		ChaosConfig:    chaos.NoChaos("BTC-MED"),
+		ReplayOrders:   orders,
+		Sink:           sink,
+		OrderQueue:     q,
+		InitialBalance: types.QtyFromFloat(100_000),
+		PlayerAddress:  "player1",
+	}
+	a, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	return a, q, sink
+}
+
+// TestUserOrder_MarketBuy injects a market buy order before the actor starts.
+// The replay tick loop will drain it and we expect at least one fill.
+func TestUserOrder_MarketBuy(t *testing.T) {
+	a, q, _ := buildActorWithQueue(t)
+
+	buyOrder := &types.Order{
+		Symbol:   "BTC-MED",
+		Side:     types.SideBuy,
+		Type:     types.OrderTypeMarket,
+		Quantity: types.QtyFromFloat(0.01),
+		Owner:    "player1",
+		Source:   types.SourceUser,
+	}
+	uo := &UserOrder{
+		Order:    buyOrder,
+		ResultCh: make(chan UserOrderResult, 1),
+	}
+	q <- uo
+
+	// Close the queue so Run() exits after draining it
+	close(q)
+
+	// Run the actor to completion (it will drain the queue during tick processing)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := a.Run(ctx); err != nil && err != context.Canceled {
+		t.Fatalf("Run: %v", err)
+	}
+
+	select {
+	case res := <-uo.ResultCh:
+		if res.Err != nil {
+			t.Fatalf("market buy error: %v", res.Err)
+		}
+		if len(res.Trades) == 0 {
+			t.Error("expected fills for market buy with resting sell orders, got none")
+		}
+		for _, tr := range res.Trades {
+			t.Logf("fill: qty=%s @ price=%s", tr.Quantity.String(), tr.Price.String())
+		}
+	default:
+		t.Error("no result received from actor for market buy order")
+	}
+}
+
+// TestUserOrder_LimitRested submits a limit buy far below the market price.
+// Expects no immediate fill (order should be rested on the book).
+func TestUserOrder_LimitRested(t *testing.T) {
+	a, q, _ := buildActorWithQueue(t)
+
+	// Place a limit buy at a price far below current market (won't cross)
+	lowPrice := types.PriceFromFloat(1.0) // $1 — way below any ask
+	limitOrder := &types.Order{
+		Symbol:   "BTC-MED",
+		Side:     types.SideBuy,
+		Type:     types.OrderTypeLimit,
+		Price:    lowPrice,
+		Quantity: types.QtyFromFloat(0.1),
+		Owner:    "player1",
+		Source:   types.SourceUser,
+	}
+	uo := &UserOrder{
+		Order:    limitOrder,
+		ResultCh: make(chan UserOrderResult, 1),
+	}
+	q <- uo
+	close(q)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := a.Run(ctx); err != nil && err != context.Canceled {
+		t.Fatalf("Run: %v", err)
+	}
+
+	select {
+	case res := <-uo.ResultCh:
+		if res.Err != nil {
+			t.Fatalf("limit rested error: %v", res.Err)
+		}
+		// Should have zero immediate fills (price is $1, far below market)
+		if len(res.Trades) != 0 {
+			t.Errorf("expected 0 fills for below-market limit, got %d", len(res.Trades))
+		}
+		t.Logf("limit order rested with 0 fills (as expected)")
+	default:
+		t.Error("no result received from actor for limit order")
+	}
+}
+
+// TestUserOrder_InsufficientBalance submits a large market buy that exceeds the player's balance.
+// Expects the account balance to never go negative.
+func TestUserOrder_InsufficientBalance(t *testing.T) {
+	orders := makeOrders(t, 5*time.Minute)
+	q := make(chan *UserOrder, 4)
+	sink := &MemorySink{}
+	cfg := Config{
+		Symbol:         "BTC-MED",
+		SessionID:      "insuff-balance",
+		LevelID:        "D-312-BTC",
+		ChaosConfig:    chaos.NoChaos("BTC-MED"),
+		ReplayOrders:   orders,
+		Sink:           sink,
+		OrderQueue:     q,
+		InitialBalance: types.QtyFromFloat(1), // only $1 — can't afford even 0.0001 BTC at $7900
+		PlayerAddress:  "poorplayer",
+	}
+	a, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	bigOrder := &types.Order{
+		Symbol:   "BTC-MED",
+		Side:     types.SideBuy,
+		Type:     types.OrderTypeMarket,
+		Quantity: types.QtyFromFloat(1.0), // 1 BTC @ ~$7900 = $7900, far exceeds $1
+		Owner:    "poorplayer",
+		Source:   types.SourceUser,
+	}
+	uo := &UserOrder{
+		Order:    bigOrder,
+		ResultCh: make(chan UserOrderResult, 1),
+	}
+	q <- uo
+	close(q)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := a.Run(ctx); err != nil && err != context.Canceled {
+		t.Fatalf("Run: %v", err)
+	}
+
+	// Either the order couldn't fill (balance check) or failed with ErrInsufficientBalance
+	// In either case, the account balance should not go negative
+	acc := a.Account("poorplayer")
+	if acc != nil && acc.Balance < 0 {
+		t.Errorf("balance went negative: %s", acc.Balance.String())
+	}
+
+	select {
+	case res := <-uo.ResultCh:
+		t.Logf("result: err=%v trades=%d", res.Err, len(res.Trades))
+		// If there were fills, the error should indicate insufficient balance
+		if len(res.Trades) > 0 && res.Err == nil {
+			if acc != nil && acc.Balance < 0 {
+				t.Errorf("balance went negative after fills: %s", acc.Balance.String())
+			}
+		}
+	default:
+		t.Error("no result received from actor for insufficient balance order")
+	}
+}
