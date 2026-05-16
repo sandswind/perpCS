@@ -282,8 +282,6 @@ func makeProvider(name string) (provider.IDataProvider, error) {
 // Ensure types is used (avoids import cycle if types is not otherwise needed)
 var _ = types.SideBuy
 
-
-
 // deployment is the on-chain JSON written by contracts/script/Deploy.s.sol.
 type deployment struct {
 	ChainID     uint64 `json:"chainId"`

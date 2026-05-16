@@ -1,5 +1,6 @@
 import type { Metadata } from 'next';
 import './globals.css';
+import { Providers } from './providers';
 
 export const metadata: Metadata = {
   title: 'Perp Crisis Sandbox',
@@ -23,7 +24,7 @@ export default function RootLayout({
           overflow: 'hidden',
         }}
       >
-        {children}
+        <Providers>{children}</Providers>
       </body>
     </html>
   );

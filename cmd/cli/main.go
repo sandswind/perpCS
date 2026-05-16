@@ -45,8 +45,8 @@ func main() {
 	flag.Parse()
 
 	c := &cliClient{
-		serverURL: *server,
-		level:     *level,
+		serverURL:  *server,
+		level:      *level,
 		httpClient: &http.Client{Timeout: 10 * time.Second},
 	}
 	c.run()
@@ -249,8 +249,8 @@ func (c *cliClient) cmdAccount() {
 	}
 
 	var acc struct {
-		Balance    string `json:"balance"`
-		Positions  []struct {
+		Balance   string `json:"balance"`
+		Positions []struct {
 			Symbol   string `json:"symbol"`
 			Side     string `json:"side"`
 			Size     string `json:"size"`
