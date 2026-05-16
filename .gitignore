@@ -1,0 +1,27 @@
+# binaries
+/bin/
+/out/
+*.exe
+*.dll
+*.so
+
+# go
+*.test
+*.prof
+*.coverprofile
+coverage.out
+
+# editors / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# env / secrets
+.env
+.env.local
+deployments/*.local.json
+
+# data dumps (large historical data)
+data/
+*.zip
