@@ -241,7 +241,6 @@ func TestBalance_InsufficientFunds(t *testing.T) {
 	}
 }
 
-
 // ---- v0.4 liquidation + funding tests ----
 
 // TestIsLiquidatable_BelowMMR opens a 10× long and crashes the mark price

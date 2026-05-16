@@ -21,10 +21,10 @@ var ErrInsufficientBalance = errors.New("insufficient balance")
 type Position struct {
 	Symbol   types.Symbol
 	Side     types.Side
-	Size     types.Qty  // current position size (always positive)
+	Size     types.Qty   // current position size (always positive)
 	AvgEntry types.Price // average entry price
-	Margin   types.Qty  // isolated margin allocated (1e8 USDR)
-	UPnL     types.Qty  // unrealised PnL, updated each MarkToMarket call (can be negative)
+	Margin   types.Qty   // isolated margin allocated (1e8 USDR)
+	UPnL     types.Qty   // unrealised PnL, updated each MarkToMarket call (can be negative)
 }
 
 // Account is the player's isolated-margin account.
