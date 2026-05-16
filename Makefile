@@ -1,4 +1,4 @@
-.PHONY: all build build-server build-cli test bench replay server cli clean fmt vet tidy
+.PHONY: all build build-server build-cli build-web test bench replay server cli dev backend frontend clean fmt vet tidy
 
 GO       ?= go
 PKG      := ./...
@@ -19,6 +19,9 @@ build-cli:
 	@mkdir -p $(BIN_DIR)
 	$(GO) build -o $(BIN_DIR)/cli ./cmd/cli
 
+build-web:
+	cd web && npm run build
+
 test:
 	$(GO) test -race -count=1 -coverprofile=coverage.out $(PKG)
 
@@ -28,6 +31,19 @@ bench:
 replay: build
 	@mkdir -p $(OUT_DIR)
 	$(BIN_DIR)/replay --level=$(or $(LEVEL),D-312-BTC) --speed=$(or $(SPEED),60x) --provider=$(or $(PROVIDER),mock) --out=$(OUT_DIR)
+
+# v0.3: one-command startup — runs backend + frontend in parallel
+# Press Ctrl-C twice (or kill the background PID) to stop.
+dev:
+	@echo "Starting backend on :8080 and frontend on :3000"
+	@(make backend &) && make frontend
+
+backend: build-server
+	@mkdir -p $(OUT_DIR)
+	$(BIN_DIR)/server --level=$(or $(LEVEL),D-312-BTC) --seed=$(or $(SEED),42) --port=$(or $(PORT),8080) --balance=$(or $(BALANCE),10000)
+
+frontend:
+	cd web && npm run dev
 
 server: build-server
 	$(BIN_DIR)/server --level=$(or $(LEVEL),D-312-BTC) --seed=$(or $(SEED),42) --port=$(or $(PORT),8080)
