@@ -1,11 +1,13 @@
-// Package server implements the HTTP API for v0.2 CLI Trader.
+// Package server implements the HTTP API for v0.2 CLI Trader and v0.3 Web Trader.
 //
 // Routes:
 //
-//	GET  /health          — liveness probe
-//	POST /orders          — place a limit or market order
-//	DELETE /orders/{id}   — cancel an order by ID
-//	GET  /account         — return account state (balance, positions, open orders)
+//	GET  /health                — liveness probe
+//	POST /orders                — place a limit or market order
+//	DELETE /orders/{id}         — cancel an order by ID
+//	GET  /account               — return account state (balance, positions, open orders)
+//	GET  /ws/market/{symbol}    — WebSocket: orderbook snapshots + trades
+//	GET  /ws/account/{sid}      — WebSocket: fill + position updates for a session
 //
 // Design rules:
 //   - All communication with the MarketActor goes through the OrderQueue channel.
@@ -25,23 +27,51 @@ import (
 
 	"github.com/sandswind/perpCS/internal/account"
 	"github.com/sandswind/perpCS/internal/actor"
+	"github.com/sandswind/perpCS/internal/fanout"
 	"github.com/sandswind/perpCS/internal/types"
 )
 
 // Server wraps the HTTP handler for the trading API.
 type Server struct {
+	actor   *actor.Actor
 	account *account.Account
 	queue   chan *actor.UserOrder
+	fanout  *fanout.Fanout
 	symbol  types.Symbol
 }
 
 // New creates a Server. queue must be the same channel passed to actor.Config.OrderQueue.
+// fo may be nil (v0.2 compat); pass a *fanout.Fanout for WS support.
 func New(acc *account.Account, queue chan *actor.UserOrder, symbol types.Symbol) *Server {
 	return &Server{
 		account: acc,
 		queue:   queue,
 		symbol:  symbol,
 	}
+}
+
+// NewWithFanout creates a Server with WebSocket fanout support.
+func NewWithFanout(acc *account.Account, queue chan *actor.UserOrder, symbol types.Symbol, fo *fanout.Fanout) *Server {
+	return &Server{
+		account: acc,
+		queue:   queue,
+		fanout:  fo,
+		symbol:  symbol,
+	}
+}
+
+// corsMiddleware allows requests from the Next.js dev server on localhost:3000.
+func corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "http://localhost:3000")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(204)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // Handler returns an http.Handler with all routes registered.
@@ -52,7 +82,20 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /orders", s.handlePostOrder)
 	mux.HandleFunc("DELETE /orders/{id}", s.handleDeleteOrder)
 	mux.HandleFunc("GET /account", s.handleGetAccount)
-	return mux
+
+	// WebSocket routes (v0.3)
+	if s.fanout != nil {
+		mux.Handle("GET /ws/market/{symbol}", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			symbol := r.PathValue("symbol")
+			s.fanout.ServeMarket(symbol).ServeHTTP(w, r)
+		}))
+		mux.Handle("GET /ws/account/{sid}", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			sid := r.PathValue("sid")
+			s.fanout.ServeAccount(sid).ServeHTTP(w, r)
+		}))
+	}
+
+	return corsMiddleware(mux)
 }
 
 // ---- request / response types ----

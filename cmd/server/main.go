@@ -1,7 +1,7 @@
-// cmd/server is the v0.2 HTTP server entry point.
+// cmd/server is the v0.3 HTTP + WebSocket server entry point.
 //
 // It starts a MarketActor (replay engine) and an HTTP API server,
-// allowing CLI clients to submit and manage orders.
+// allowing CLI clients and web browsers to submit and manage orders.
 //
 // Usage:
 //
@@ -31,6 +31,7 @@ import (
 
 	"github.com/sandswind/perpCS/internal/actor"
 	"github.com/sandswind/perpCS/internal/chaos"
+	"github.com/sandswind/perpCS/internal/fanout"
 	"github.com/sandswind/perpCS/internal/provider"
 	"github.com/sandswind/perpCS/internal/server"
 	"github.com/sandswind/perpCS/internal/types"
@@ -97,10 +98,19 @@ func run() error {
 	actor.SortOrders(orders)
 	fmt.Printf("[data]   %d replay orders ready\n", len(orders))
 
-	// ---- create actor ----
+	// ---- create fanout + sink ----
+	fo := fanout.New()
 	initialBalance := types.QtyFromFloat(*balanceFloat)
 	queue := make(chan *actor.UserOrder, 256)
-	sink := &actor.NullSink{} // TODO v0.3: tee to JSONL + WS fanout
+
+	// TeeSink: JSONL file (for audit) + WS fanout
+	var sink actor.EventSink
+	if jsonlSink, jsonlErr := actor.NewJSONLSink(fmt.Sprintf("out/%s-events.jsonl", *level)); jsonlErr != nil {
+		fmt.Printf("[warn] could not create JSONL sink: %v — using fanout only\n", jsonlErr)
+		sink = fo
+	} else {
+		sink = &actor.TeeSink{A: jsonlSink, B: fo}
+	}
 
 	chaosConfig := chaos.BTC_MED_L2(uint64(*seed))
 	acfg := actor.Config{
@@ -134,7 +144,7 @@ func run() error {
 
 	// ---- HTTP server ----
 	acc := a.Account(*address)
-	srv := server.New(acc, queue, "BTC-MED")
+	srv := server.NewWithFanout(acc, queue, "BTC-MED", fo)
 	httpSrv := &http.Server{
 		Addr:         fmt.Sprintf(":%d", *port),
 		Handler:      srv.Handler(),
