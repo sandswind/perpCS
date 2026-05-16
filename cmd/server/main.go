@@ -112,6 +112,15 @@ func run() error {
 		sink = &actor.TeeSink{A: jsonlSink, B: fo}
 	}
 
+	// Pull funding rate history (8h cadence) for v0.4 settlements.
+	var fundingPts []actor.FundingPoint
+	if rates, ferr := prov.FetchFundingRates(ctx, "BTCUSDT", from, to); ferr == nil {
+		fundingPts = make([]actor.FundingPoint, len(rates))
+		for i, r := range rates {
+			fundingPts[i] = actor.FundingPoint{TS: r.TS, Rate: r.Rate}
+		}
+	}
+
 	chaosConfig := chaos.BTC_MED_L2(uint64(*seed))
 	acfg := actor.Config{
 		Symbol:         "BTC-MED",
@@ -119,6 +128,8 @@ func run() error {
 		LevelID:        *level,
 		ChaosConfig:    chaosConfig,
 		ReplayOrders:   orders,
+		Klines:         klines,
+		FundingRates:   fundingPts,
 		Sink:           sink,
 		OrderQueue:     queue,
 		InitialBalance: initialBalance,

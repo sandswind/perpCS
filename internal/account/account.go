@@ -245,6 +245,115 @@ func (a *Account) MarginRatioForSymbol(symbol types.Symbol, markPrice types.Pric
 	return float64(equity) / float64(notional)
 }
 
+// MaintenanceMarginRatio is the minimum equity-to-notional ratio before a
+// position is force-closed. 5% matches typical perpetual exchange policy.
+const MaintenanceMarginRatio = 0.05
+
+// IsLiquidatable returns whether the position for symbol has dropped below
+// the maintenance margin ratio (5%) given the current mark price.
+//
+// The position-level UPnL is recomputed from markPrice in this call, so the
+// caller does NOT need to invoke MarkToMarket beforehand. Returns false if
+// there is no open position.
+func (a *Account) IsLiquidatable(symbol types.Symbol, markPrice types.Price) bool {
+	pos, ok := a.Positions[symbol]
+	if !ok || pos.Size == 0 {
+		return false
+	}
+	// Per-position margin ratio: (margin + uPnL) / positionNotional.
+	// We use isolated margin so other positions / balance do not rescue
+	// this one.
+	var uPnL int64
+	if pos.Side == types.SideBuy {
+		uPnL = types.Notional(markPrice-pos.AvgEntry, pos.Size)
+	} else {
+		uPnL = types.Notional(pos.AvgEntry-markPrice, pos.Size)
+	}
+	notional := types.Notional(markPrice, pos.Size)
+	if notional <= 0 {
+		return false
+	}
+	equity := int64(pos.Margin) + uPnL
+	if equity <= 0 {
+		return true // already underwater
+	}
+	return float64(equity)/float64(notional) <= MaintenanceMarginRatio
+}
+
+// Liquidate performs a forced close of the position at markPrice.
+//
+// The flow:
+//  1. Compute realised loss = -uPnL (since uPnL is negative for liquidatable longs).
+//  2. Take the loss from the position's Margin first; whatever remains in Margin
+//     after absorbing the loss returns to Balance (the "salvage").
+//  3. If the loss exceeds Margin, the excess is reported as `loss` for the
+//     insurance fund to absorb (Balance is NOT touched — isolated margin).
+//  4. Position is removed from the account.
+//
+// Returns the size that needs to be closed in the market (taker side opposite
+// to position) and `loss` = the shortfall that the insurance fund must cover.
+// `loss` is always >= 0; a profitable liquidation (theoretically possible only
+// if mark price stale) returns 0.
+func (a *Account) Liquidate(symbol types.Symbol) (size types.Qty, loss types.Qty) {
+	pos, ok := a.Positions[symbol]
+	if !ok || pos.Size == 0 {
+		return 0, 0
+	}
+	size = pos.Size
+
+	// uPnL (already updated by MarkToMarket in the caller)
+	uPnL := int64(pos.UPnL)
+	margin := int64(pos.Margin)
+
+	// equity remaining in this isolated margin position
+	equity := margin + uPnL
+
+	if equity > 0 {
+		// Position still has positive equity — return it to balance.
+		// (This should be small, near MMR threshold; insurance fund gets 0.)
+		a.Balance += types.Qty(equity)
+		loss = 0
+	} else {
+		// Position is underwater past margin. Balance not touched (isolated).
+		// Insurance fund must absorb the deficit.
+		loss = types.Qty(-equity)
+	}
+
+	delete(a.Positions, symbol)
+	return size, loss
+}
+
+// ApplyFunding charges or credits the account based on the funding rate and
+// position notional.
+//
+// Convention (matches Binance / FTX):
+//
+//	fundingRate > 0  → longs PAY shorts  (long balance decreases)
+//	fundingRate < 0  → shorts PAY longs  (long balance increases)
+//
+// Charge formula:  payment = side * positionNotional * fundingRate
+// where `side` is +1 for long, -1 for short. Balance is mutated in place.
+func (a *Account) ApplyFunding(symbol types.Symbol, fundingRate float64, markPrice types.Price) {
+	pos, ok := a.Positions[symbol]
+	if !ok || pos.Size == 0 {
+		return
+	}
+	if fundingRate == 0 {
+		return
+	}
+	notional := types.Notional(markPrice, pos.Size)
+	// Use float64 only for the rate × notional product. notional is int64,
+	// rate is small (~1e-4), so precision loss is well below one satoshi.
+	payment := int64(float64(notional) * fundingRate)
+	if pos.Side == types.SideBuy {
+		// long pays when rate > 0
+		a.Balance -= types.Qty(payment)
+	} else {
+		// short receives when rate > 0 (and pays when rate < 0)
+		a.Balance += types.Qty(payment)
+	}
+}
+
 // Validate checks internal invariants. Returns an error if violated.
 // Should be called after every mutation in test builds.
 func (a *Account) Validate() error {

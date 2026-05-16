@@ -4,6 +4,10 @@
 *.exe
 *.dll
 *.so
+# top-level stray go-build artefacts
+/cli
+/replay
+/server
 
 # go
 *.test

@@ -18,14 +18,32 @@ export interface Fill {
   pnl: string;
 }
 
+// LiquidationEvent matches the server-side fanout.liquidationMsg payload.
+export interface LiquidationEvent {
+  symbol: string;
+  size: string;
+  mark_price: string;
+  loss: string;
+  ts: number;
+}
+
+// FundingEvent matches the server-side fanout.fundingMsg payload.
+export interface FundingEvent {
+  rate: number;
+  ts: number;
+}
+
 interface WSEnvelope {
   type: string;
-  data: Position | Fill;
+  data: Position | Fill | LiquidationEvent | FundingEvent;
 }
 
 export function useAccountWS(sessionId: string) {
   const [position, setPosition] = useState<Position | null>(null);
   const [fills, setFills] = useState<Fill[]>([]);
+  const [liquidation, setLiquidation] = useState<LiquidationEvent | null>(null);
+  const [fundingRate, setFundingRate] = useState<number | null>(null);
+  const [lastFundingTS, setLastFundingTS] = useState<number | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -44,6 +62,12 @@ export function useAccountWS(sessionId: string) {
         } else if (envelope.type === 'fill') {
           const fill = envelope.data as Fill;
           setFills((prev) => [fill, ...prev].slice(0, 50));
+        } else if (envelope.type === 'liquidation') {
+          setLiquidation(envelope.data as LiquidationEvent);
+        } else if (envelope.type === 'funding') {
+          const f = envelope.data as FundingEvent;
+          setFundingRate(f.rate);
+          setLastFundingTS(f.ts);
         }
       } catch {
         // ignore
@@ -69,5 +93,5 @@ export function useAccountWS(sessionId: string) {
     };
   }, [connect]);
 
-  return { position, fills };
+  return { position, fills, liquidation, fundingRate, lastFundingTS };
 }

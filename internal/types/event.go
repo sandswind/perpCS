@@ -13,6 +13,9 @@ const (
 	EventBookSnapshot   EventType = "book_snapshot"
 	EventSessionStart   EventType = "session_start"
 	EventSessionEnd     EventType = "session_end"
+	// v0.4 events
+	EventLiquidation EventType = "liquidation"
+	EventFunding     EventType = "funding"
 )
 
 // Event is a tagged union written to the audit log. The Payload field
@@ -59,4 +62,21 @@ type SessionStartPayload struct {
 type SessionEndPayload struct {
 	TotalTrades int   `json:"total_trades"`
 	FinalTS     int64 `json:"final_ts"`
+}
+
+// LiquidationPayload is emitted when an account's marginRatio drops below MMR
+// and the position is force-closed.
+type LiquidationPayload struct {
+	Address   string `json:"address"`
+	Symbol    Symbol `json:"symbol"`
+	Size      Qty    `json:"size"`
+	MarkPrice Price  `json:"mark_price"`
+	Loss      Qty    `json:"loss"`
+	TS        int64  `json:"ts"`
+}
+
+// FundingPayload is emitted at every 8h funding settlement.
+type FundingPayload struct {
+	Rate float64 `json:"rate"`
+	TS   int64   `json:"ts"`
 }
