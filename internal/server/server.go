@@ -23,11 +23,13 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/sandswind/perpCS/internal/account"
 	"github.com/sandswind/perpCS/internal/actor"
 	"github.com/sandswind/perpCS/internal/fanout"
+	"github.com/sandswind/perpCS/internal/session"
 	"github.com/sandswind/perpCS/internal/types"
 )
 
@@ -38,6 +40,13 @@ type Server struct {
 	queue   chan *actor.UserOrder
 	fanout  *fanout.Fanout
 	symbol  types.Symbol
+	// v0.5: optional on-chain session lookup. nil → /sessions endpoint
+	// returns 503.
+	sessionSvc *session.Svc
+	// v0.5: when on-chain mode is enabled, the player address is taken from
+	// the URL/query param of /account?address=0x... rather than the
+	// bootstrap account, so we can serve multi-player.
+	enableOnChain bool
 }
 
 // New creates a Server. queue must be the same channel passed to actor.Config.OrderQueue.
@@ -58,6 +67,21 @@ func NewWithFanout(acc *account.Account, queue chan *actor.UserOrder, symbol typ
 		fanout:  fo,
 		symbol:  symbol,
 	}
+}
+
+// WithActor attaches the actor reference so the server can look up accounts
+// by address (v0.5 multi-player path).
+func (s *Server) WithActor(a *actor.Actor) *Server {
+	s.actor = a
+	return s
+}
+
+// WithSessions enables the /sessions/{addr} endpoint, backed by the v0.5
+// session.Svc.
+func (s *Server) WithSessions(svc *session.Svc) *Server {
+	s.sessionSvc = svc
+	s.enableOnChain = true
+	return s
 }
 
 // corsMiddleware allows requests from the Next.js dev server on localhost:3000.
@@ -82,6 +106,12 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /orders", s.handlePostOrder)
 	mux.HandleFunc("DELETE /orders/{id}", s.handleDeleteOrder)
 	mux.HandleFunc("GET /account", s.handleGetAccount)
+
+	// v0.5: on-chain session lookup
+	if s.sessionSvc != nil {
+		mux.HandleFunc("GET /sessions/{addr}", s.handleGetSessionByAddress)
+		mux.HandleFunc("GET /sessions/by-id/{sid}", s.handleGetSessionByID)
+	}
 
 	// WebSocket routes (v0.3)
 	if s.fanout != nil {
@@ -285,17 +315,18 @@ func (s *Server) handleDeleteOrder(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s *Server) handleGetAccount(w http.ResponseWriter, _ *http.Request) {
-	if s.account == nil {
+func (s *Server) handleGetAccount(w http.ResponseWriter, r *http.Request) {
+	acc := s.resolveAccount(r)
+	if acc == nil {
 		writeError(w, http.StatusNotFound, "no account")
 		return
 	}
 	resp := accountResponse{
-		Balance:    s.account.Balance.String(),
-		Positions:  make([]positionSummary, 0, len(s.account.Positions)),
-		OpenOrders: make([]openOrderSummary, 0, len(s.account.OpenOrders)),
+		Balance:    acc.Balance.String(),
+		Positions:  make([]positionSummary, 0, len(acc.Positions)),
+		OpenOrders: make([]openOrderSummary, 0, len(acc.OpenOrders)),
 	}
-	for _, pos := range s.account.Positions {
+	for _, pos := range acc.Positions {
 		resp.Positions = append(resp.Positions, positionSummary{
 			Symbol:   string(pos.Symbol),
 			Side:     pos.Side.String(),
@@ -305,7 +336,7 @@ func (s *Server) handleGetAccount(w http.ResponseWriter, _ *http.Request) {
 			UPnL:     pos.UPnL.String(),
 		})
 	}
-	for _, o := range s.account.OpenOrders {
+	for _, o := range acc.OpenOrders {
 		resp.OpenOrders = append(resp.OpenOrders, openOrderSummary{
 			ID:       uint64(o.ID),
 			Side:     o.Side.String(),
@@ -318,12 +349,87 @@ func (s *Server) handleGetAccount(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
-// playerAddress returns the account owner string.
+// resolveAccount picks the right account for the request:
+//   - If ?address=0x... is set AND the actor has that address → that account.
+//   - Otherwise fall back to the bootstrap s.account (v0.4 single-player demo).
+func (s *Server) resolveAccount(r *http.Request) *account.Account {
+	if s.actor != nil {
+		if addr := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("address"))); addr != "" {
+			if acc := s.actor.Account(addr); acc != nil {
+				return acc
+			}
+			return nil
+		}
+	}
+	return s.account
+}
+
+// playerAddress returns the account owner string for the bootstrap account
+// (only used by /orders right now, where v0.4 demos remain single-player).
 func (s *Server) playerAddress() string {
 	if s.account != nil {
 		return s.account.Address
 	}
 	return "player"
+}
+
+// handleGetSessionByAddress: GET /sessions/{addr}
+//
+// Returns 404 until the indexer has confirmed a deposit for {addr} AND the
+// actor has created the corresponding vAccount. The frontend polls this
+// endpoint after deposit() to know when to redirect the player to the
+// trading view.
+func (s *Server) handleGetSessionByAddress(w http.ResponseWriter, r *http.Request) {
+	addr := strings.ToLower(r.PathValue("addr"))
+	if addr == "" {
+		writeError(w, http.StatusBadRequest, "missing address")
+		return
+	}
+	rec := s.sessionSvc.LookupByPlayer(addr)
+	if rec == nil {
+		writeError(w, http.StatusNotFound, "no session for address")
+		return
+	}
+	// Check that the actor goroutine has materialised the vAccount. If not,
+	// the indexer has confirmed but the actor hasn't drained the queue yet —
+	// return 202 so the FE knows to keep polling.
+	ready := s.actor != nil && s.actor.HasAccount(addr)
+	writeJSON(w, statusForReady(ready), sessionResponse{
+		Ready:   ready,
+		Session: rec,
+	})
+}
+
+// handleGetSessionByID: GET /sessions/by-id/{sid}
+func (s *Server) handleGetSessionByID(w http.ResponseWriter, r *http.Request) {
+	sid := strings.ToLower(r.PathValue("sid"))
+	if sid == "" {
+		writeError(w, http.StatusBadRequest, "missing session id")
+		return
+	}
+	rec := s.sessionSvc.LookupBySession(sid)
+	if rec == nil {
+		writeError(w, http.StatusNotFound, "no session with that id")
+		return
+	}
+	ready := s.actor != nil && s.actor.HasAccount(rec.Player)
+	writeJSON(w, statusForReady(ready), sessionResponse{
+		Ready:   ready,
+		Session: rec,
+	})
+}
+
+// sessionResponse is the JSON shape returned by /sessions/{addr}.
+type sessionResponse struct {
+	Ready   bool            `json:"ready"`
+	Session *session.Record `json:"session"`
+}
+
+func statusForReady(ready bool) int {
+	if ready {
+		return http.StatusOK
+	}
+	return http.StatusAccepted // 202 — confirmed on chain, vAccount still being created
 }
 
 // ---- helpers ----

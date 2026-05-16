@@ -21,19 +21,23 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
 	"github.com/sandswind/perpCS/internal/actor"
+	"github.com/sandswind/perpCS/internal/chain"
 	"github.com/sandswind/perpCS/internal/chaos"
 	"github.com/sandswind/perpCS/internal/fanout"
 	"github.com/sandswind/perpCS/internal/provider"
 	"github.com/sandswind/perpCS/internal/server"
+	"github.com/sandswind/perpCS/internal/session"
 	"github.com/sandswind/perpCS/internal/types"
 )
 
@@ -53,6 +57,17 @@ func run() error {
 	port := flag.Int("port", 8080, "HTTP listen port")
 	balanceFloat := flag.Float64("balance", 10000, "player initial balance in USDR")
 	address := flag.String("address", "player1", "player wallet address")
+
+	// v0.5: on-chain entry. When --chain-rpc is set, the server starts
+	// the chain.Indexer + session.Svc and accepts /sessions/{addr} polls.
+	chainRPC := flag.String("chain-rpc", "", "EVM JSON-RPC URL (enables on-chain entry; off when empty)")
+	chainDeployments := flag.String("chain-deployments", "deployments/arbitrum-sepolia.json", "deployments JSON path")
+	chainConfirmations := flag.Uint64("chain-confirmations", chain.DefaultConfirmations, "block confirmations before dispatching SessionStarted")
+	chainPollMs := flag.Int("chain-poll-ms", 4000, "Indexer poll interval in milliseconds")
+	chainStartBlock := flag.Uint64("chain-start-block", 0, "Indexer start block (0 → use deploy block from JSON)")
+	chainStatePath := flag.String("chain-state", "out/indexer-state.json", "Indexer state file path")
+	chainAuditPath := flag.String("chain-audit", "out/sessions.jsonl", "Session audit JSONL path")
+
 	flag.Parse()
 
 	dur, err := time.ParseDuration(*durStr)
@@ -122,6 +137,7 @@ func run() error {
 	}
 
 	chaosConfig := chaos.BTC_MED_L2(uint64(*seed))
+	sessionQueue := make(chan *actor.OpenSessionRequest, 64)
 	acfg := actor.Config{
 		Symbol:         "BTC-MED",
 		SessionID:      fmt.Sprintf("%s-%d", *level, time.Now().UnixNano()),
@@ -132,6 +148,7 @@ func run() error {
 		FundingRates:   fundingPts,
 		Sink:           sink,
 		OrderQueue:     queue,
+		SessionQueue:   sessionQueue,
 		InitialBalance: initialBalance,
 		PlayerAddress:  *address,
 	}
@@ -155,7 +172,58 @@ func run() error {
 
 	// ---- HTTP server ----
 	acc := a.Account(*address)
-	srv := server.NewWithFanout(acc, queue, "BTC-MED", fo)
+	srv := server.NewWithFanout(acc, queue, "BTC-MED", fo).WithActor(a)
+
+	// ---- v0.5: optional on-chain entry path ----
+	if *chainRPC != "" {
+		dep, err := loadDeployment(*chainDeployments)
+		if err != nil {
+			return fmt.Errorf("load deployments %s: %w", *chainDeployments, err)
+		}
+		if !looksLikeAddress(dep.Vault) {
+			return fmt.Errorf("deployments %s has no GameVault address", *chainDeployments)
+		}
+		startBlock := *chainStartBlock
+		if startBlock == 0 {
+			startBlock = dep.BlockNumber
+		}
+
+		client := chain.NewClient(*chainRPC, &http.Client{Timeout: 10 * time.Second})
+		sessSvc, err := session.New(session.Config{
+			Queue:     sessionQueue,
+			AuditPath: *chainAuditPath,
+		})
+		if err != nil {
+			return fmt.Errorf("session svc: %w", err)
+		}
+
+		idx, err := chain.New(chain.Config{
+			Client:        client,
+			VaultAddress:  dep.Vault,
+			StartBlock:    startBlock,
+			StatePath:     *chainStatePath,
+			Confirmations: *chainConfirmations,
+			PollInterval:  time.Duration(*chainPollMs) * time.Millisecond,
+			Handler:       sessSvc,
+		})
+		if err != nil {
+			return fmt.Errorf("indexer: %w", err)
+		}
+
+		go func() {
+			fmt.Printf("[chain]  indexer starting; rpc=%s vault=%s startBlock=%d\n",
+				*chainRPC, dep.Vault, startBlock)
+			if err := idx.Run(ctx); err != nil && err != context.Canceled {
+				fmt.Printf("[chain]  indexer error: %v\n", err)
+			}
+		}()
+
+		srv = srv.WithSessions(sessSvc)
+		fmt.Printf("[server] on-chain entry ENABLED (vault=%s)\n", dep.Vault)
+	} else {
+		fmt.Printf("[server] on-chain entry disabled (set --chain-rpc to enable)\n")
+	}
+
 	httpSrv := &http.Server{
 		Addr:         fmt.Sprintf(":%d", *port),
 		Handler:      srv.Handler(),
@@ -213,3 +281,40 @@ func makeProvider(name string) (provider.IDataProvider, error) {
 
 // Ensure types is used (avoids import cycle if types is not otherwise needed)
 var _ = types.SideBuy
+
+
+
+// deployment is the on-chain JSON written by contracts/script/Deploy.s.sol.
+type deployment struct {
+	ChainID     uint64 `json:"chainId"`
+	BlockNumber uint64 `json:"blockNumber"`
+	USDR        string `json:"usdr"`
+	Faucet      string `json:"faucet"`
+	Vault       string `json:"vault"`
+}
+
+func loadDeployment(path string) (*deployment, error) {
+	abs, _ := filepath.Abs(path)
+	b, err := os.ReadFile(abs)
+	if err != nil {
+		return nil, err
+	}
+	var d deployment
+	if err := json.Unmarshal(b, &d); err != nil {
+		return nil, err
+	}
+	return &d, nil
+}
+
+// looksLikeAddress is a cheap sanity check: 0x-prefixed and not all zero.
+func looksLikeAddress(s string) bool {
+	if len(s) != 42 || s[0] != '0' || s[1] != 'x' {
+		return false
+	}
+	for _, c := range s[2:] {
+		if c != '0' {
+			return true
+		}
+	}
+	return false
+}

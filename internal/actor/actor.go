@@ -73,6 +73,24 @@ type UserOrderResult struct {
 	Err    error
 }
 
+// OpenSessionRequest is the v0.5 envelope for "create a vAccount" instructions
+// that arrive from the chain Indexer / Session Svc. The actor processes these
+// from its single goroutine so the accounts map mutation stays race-free.
+//
+// The caller (typically session.Svc) must send this into Config.SessionQueue
+// and (optionally) wait on ResultCh.
+type OpenSessionRequest struct {
+	SessionID string
+	Address   string    // 0x-prefixed lowercased player address
+	Balance   types.Qty // 1e8-scaled USDR (caller converts from 18-decimal raw token units)
+	ResultCh  chan OpenSessionResult
+}
+
+// OpenSessionResult mirrors the existing UserOrderResult pattern.
+type OpenSessionResult struct {
+	Err error
+}
+
 // Config holds the parameters for one MarketActor session.
 type Config struct {
 	Symbol      types.Symbol
@@ -93,6 +111,9 @@ type Config struct {
 	// OrderQueue delivers user orders to the actor goroutine.
 	// If nil, the actor runs in replay-only mode (no user interaction).
 	OrderQueue <-chan *UserOrder
+	// SessionQueue delivers OpenSession requests (v0.5 on-chain entry).
+	// If nil, the actor only ever has the bootstrap account from PlayerAddress.
+	SessionQueue <-chan *OpenSessionRequest
 	// InitialBalance is the player's starting balance (1e8 USDR scaled).
 	// If 0 the account is not created (replay-only mode).
 	InitialBalance types.Qty
@@ -198,6 +219,21 @@ func (a *Actor) Account(address string) *account.Account {
 	return a.accounts[address]
 }
 
+// HasAccount reports whether an account with the given address has been
+// created by either the bootstrap config or an OpenSession request.
+//
+// CONCURRENCY NOTE: this is intended for the post-startup lookup path where
+// the writer (actor goroutine) and the reader (HTTP handler) coordinate via
+// the same map without a mutex. In v0.5 the read happens after a 5-block
+// confirmation delay (~7s on Arbitrum Sepolia), which is long after the
+// corresponding write — making a torn read effectively impossible. We
+// nevertheless mark this as a known v0.6 cleanup target (push lookup through
+// the actor goroutine via a request channel).
+func (a *Actor) HasAccount(address string) bool {
+	_, ok := a.accounts[address]
+	return ok
+}
+
 // InsuranceFund returns the current insurance fund balance (read after Run).
 func (a *Actor) InsuranceFund() types.Qty { return a.insuranceFund }
 
@@ -234,7 +270,7 @@ func (a *Actor) Run(ctx context.Context) error {
 	}
 
 	// After all replay ticks, keep processing user orders until ctx is done
-	if a.cfg.OrderQueue != nil {
+	if a.cfg.OrderQueue != nil || a.cfg.SessionQueue != nil {
 		for {
 			select {
 			case <-ctx.Done():
@@ -249,6 +285,14 @@ func (a *Actor) Run(ctx context.Context) error {
 				} else {
 					trades, err := a.processUserOrder(uord.Order, lastTS)
 					uord.ResultCh <- UserOrderResult{Trades: trades, Err: err}
+				}
+			case sreq, ok := <-a.cfg.SessionQueue:
+				if !ok {
+					goto runDone
+				}
+				err := a.openSession(sreq)
+				if sreq.ResultCh != nil {
+					sreq.ResultCh <- OpenSessionResult{Err: err}
 				}
 			}
 		}
@@ -287,6 +331,7 @@ func (a *Actor) processTick(ts int64, tick []*types.Order) error {
 
 	// 4. Drain user order queue (non-blocking)
 	a.drainUserQueue(ts)
+	a.drainSessionQueue()
 
 	// 5. Mark price (with oracle lag) — ALWAYS advance the chaos buffer so
 	// MarkPrice() returns deterministic lagged values regardless of book state.
@@ -349,6 +394,51 @@ func (a *Actor) drainUserQueue(ts int64) {
 			return
 		}
 	}
+}
+
+// drainSessionQueue pulls and processes any pending OpenSession requests.
+// Non-blocking: returns when the queue is empty.
+func (a *Actor) drainSessionQueue() {
+	if a.cfg.SessionQueue == nil {
+		return
+	}
+	for {
+		select {
+		case sreq, ok := <-a.cfg.SessionQueue:
+			if !ok {
+				return
+			}
+			err := a.openSession(sreq)
+			if sreq.ResultCh != nil {
+				sreq.ResultCh <- OpenSessionResult{Err: err}
+			}
+		default:
+			return
+		}
+	}
+}
+
+// openSession creates a fresh vAccount on the actor goroutine. It is a no-op
+// (returns nil) if an account for the address already exists — the indexer
+// is expected to be idempotent across restarts and multi-block scans.
+func (a *Actor) openSession(req *OpenSessionRequest) error {
+	if req == nil {
+		return fmt.Errorf("openSession: nil request")
+	}
+	if req.Address == "" {
+		return fmt.Errorf("openSession: empty address")
+	}
+	if req.Balance <= 0 {
+		return fmt.Errorf("openSession: balance must be > 0 (got %s)", req.Balance.String())
+	}
+	if _, exists := a.accounts[req.Address]; exists {
+		// Treat as idempotent — duplicate event delivery is normal during
+		// indexer restart / chunked re-scan.
+		return nil
+	}
+	a.accounts[req.Address] = account.New(req.Address, req.SessionID, req.Balance)
+	a.initialDeposits += req.Balance
+	return nil
 }
 
 // maybeInjectWick consults the chaos engine for this kline and, if a wick
