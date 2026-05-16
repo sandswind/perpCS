@@ -236,3 +236,103 @@ func TestFanout_AccountFill(t *testing.T) {
 		t.Logf("fill message: %s", accMsg)
 	}
 }
+
+
+// ---- v0.4 liquidation / funding tests ----
+
+// makeLiquidationEvent builds a types.Event of type EventLiquidation.
+func makeLiquidationEvent(address, symbol string) types.Event {
+	payload, _ := json.Marshal(types.LiquidationPayload{
+		Address:   address,
+		Symbol:    types.Symbol(symbol),
+		Size:      types.QtyFromFloat(0.5),
+		MarkPrice: types.PriceFromFloat(7000),
+		Loss:      types.QtyFromFloat(120.5),
+		TS:        9_000_000,
+	})
+	return types.Event{Seq: 3, Type: types.EventLiquidation, Payload: payload}
+}
+
+// makeFundingEvent builds a types.Event of type EventFunding.
+func makeFundingEvent() types.Event {
+	payload, _ := json.Marshal(types.FundingPayload{
+		Rate: 0.0002,
+		TS:   12_345_678,
+	})
+	return types.Event{Seq: 4, Type: types.EventFunding, Payload: payload}
+}
+
+// TestFanout_Liquidation verifies the address-targeted liquidation message.
+func TestFanout_Liquidation(t *testing.T) {
+	f := New()
+	target := f.Subscribe("account", "playerX")
+	other := f.Subscribe("account", "playerY") // should NOT receive
+	defer f.Unsubscribe("account", "playerX", target)
+	defer f.Unsubscribe("account", "playerY", other)
+
+	if err := f.Emit(makeLiquidationEvent("playerX", "BTC-MED")); err != nil {
+		t.Fatalf("Emit: %v", err)
+	}
+
+	msg, ok := recvWithTimeout(target, 100*time.Millisecond)
+	if !ok {
+		t.Fatal("timed out waiting for liquidation message on playerX")
+	}
+	var env wsMessage
+	if err := json.Unmarshal(msg, &env); err != nil {
+		t.Fatalf("unmarshal envelope: %v", err)
+	}
+	if env.Type != "liquidation" {
+		t.Errorf("expected type=liquidation, got %q", env.Type)
+	}
+	var lm liquidationMsg
+	if err := json.Unmarshal(env.Data, &lm); err != nil {
+		t.Fatalf("unmarshal liquidation: %v", err)
+	}
+	if lm.Symbol != "BTC-MED" {
+		t.Errorf("symbol: got %q want BTC-MED", lm.Symbol)
+	}
+	if lm.Loss == "" || lm.Size == "" || lm.MarkPrice == "" {
+		t.Errorf("expected non-empty size/mark/loss, got %+v", lm)
+	}
+	t.Logf("liquidation message: %+v", lm)
+
+	// playerY should NOT have received anything.
+	if _, ok := recvWithTimeout(other, 50*time.Millisecond); ok {
+		t.Error("playerY should not receive playerX's liquidation message")
+	}
+}
+
+// TestFanout_Funding verifies funding is broadcast to ALL account subscribers.
+func TestFanout_Funding(t *testing.T) {
+	f := New()
+	connA := f.Subscribe("account", "alice")
+	connB := f.Subscribe("account", "bob")
+	defer f.Unsubscribe("account", "alice", connA)
+	defer f.Unsubscribe("account", "bob", connB)
+
+	if err := f.Emit(makeFundingEvent()); err != nil {
+		t.Fatalf("Emit: %v", err)
+	}
+
+	for _, conn := range []*Conn{connA, connB} {
+		msg, ok := recvWithTimeout(conn, 100*time.Millisecond)
+		if !ok {
+			t.Fatal("timed out waiting for funding message")
+		}
+		var env wsMessage
+		if err := json.Unmarshal(msg, &env); err != nil {
+			t.Fatalf("unmarshal envelope: %v", err)
+		}
+		if env.Type != "funding" {
+			t.Errorf("expected funding, got %q", env.Type)
+		}
+		var fm fundingMsg
+		if err := json.Unmarshal(env.Data, &fm); err != nil {
+			t.Fatalf("unmarshal funding: %v", err)
+		}
+		if fm.Rate != 0.0002 {
+			t.Errorf("rate: got %v want 0.0002", fm.Rate)
+		}
+	}
+}

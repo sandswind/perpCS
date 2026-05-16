@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
+	"encoding/json"
 	"testing"
 	"time"
 
+	"github.com/sandswind/perpCS/internal/account"
 	"github.com/sandswind/perpCS/internal/chaos"
 	"github.com/sandswind/perpCS/internal/provider"
 	"github.com/sandswind/perpCS/internal/types"
@@ -410,4 +412,274 @@ func TestUserOrder_InsufficientBalance(t *testing.T) {
 	default:
 		t.Error("no result received from actor for insufficient balance order")
 	}
+}
+
+
+// ---- v0.4 chaos / liquidation / funding tests ----
+
+// makeKlines returns the 1-minute klines used to drive the actor for the
+// duration window.
+func makeKlines(t *testing.T, duration time.Duration) []types.Kline {
+	t.Helper()
+	m := provider.DefaultMock()
+	from := time.Date(2020, 3, 12, 0, 0, 0, 0, time.UTC)
+	to := from.Add(duration)
+	klines, err := m.FetchKlines(context.Background(), "BTC-MED", from, to, "1m")
+	if err != nil {
+		t.Fatalf("FetchKlines: %v", err)
+	}
+	return klines
+}
+
+// countByTypeAct mirrors countByType but with a more descriptive name for v0.4.
+func countByTypeAct(events []types.Event, typ types.EventType) int {
+	return countByType(events, typ)
+}
+
+// TestLiquidation_LongAtMMR represents the canonical "10× user goes long
+// before a crash" scenario. We pre-install a thin-margin (high-leverage
+// equivalent) position and run the replay; the replay's monotonically
+// dropping prices walk the mark below MMR and trigger liquidation.
+//
+// We use the synchronous-Run pattern (close the queue before Run) so the
+// race detector is happy when reading sink.Events afterwards.
+func TestLiquidation_LongAtMMR(t *testing.T) {
+	dur := 30 * time.Minute
+	orders := makeOrders(t, dur)
+	klines := makeKlines(t, dur)
+
+	q := make(chan *UserOrder, 16)
+	sink := &MemorySink{}
+	cfg := Config{
+		Symbol:         "BTC-MED",
+		SessionID:      "liq-test",
+		LevelID:        "D-312-BTC",
+		ChaosConfig:    chaos.NoChaos("BTC-MED"),
+		ReplayOrders:   orders,
+		Klines:         klines,
+		Sink:           sink,
+		OrderQueue:     q,
+		InitialBalance: types.QtyFromFloat(10_000),
+		PlayerAddress:  "player1",
+	}
+	a, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	// Pre-install a thin-margin position simulating an earlier 10× open.
+	// At entry $8000, size 0.5 BTC, with only $50 margin (≈80× equivalent),
+	// even a small dip to ~$7900 puts equity near zero.
+	acc := a.Account("player1")
+	acc.Positions["BTC-MED"] = &account.Position{
+		Symbol:   "BTC-MED",
+		Side:     types.SideBuy,
+		Size:     types.QtyFromFloat(0.5),
+		AvgEntry: types.PriceFromFloat(8000),
+		Margin:   types.QtyFromFloat(50),
+	}
+	acc.Balance -= types.QtyFromFloat(50)
+
+	// Close the queue so Run terminates after replay.
+	close(q)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := a.Run(ctx); err != nil && err != context.Canceled {
+		t.Fatalf("Run: %v", err)
+	}
+
+	events := sink.Events
+	liq := countByTypeAct(events, types.EventLiquidation)
+	t.Logf("events=%d trades=%d liquidations=%d funding=%d",
+		len(events),
+		countByTypeAct(events, types.EventTrade),
+		liq,
+		countByTypeAct(events, types.EventFunding))
+	if liq < 1 {
+		t.Fatalf("expected ≥1 liquidation event, got %d", liq)
+	}
+}
+
+// TestLiquidation_ManualMMR drives the liquidation cascade end-to-end by
+// pre-loading the actor's account with a thin-margin position, then running
+// a short replay window with a steeply crashing mock.
+func TestLiquidation_ManualMMR(t *testing.T) {
+	dur := 30 * time.Minute
+	orders := makeOrders(t, dur)
+	klines := makeKlines(t, dur)
+
+	sink := &MemorySink{}
+	cfg := Config{
+		Symbol:         "BTC-MED",
+		SessionID:      "liq-manual",
+		LevelID:        "D-312-BTC",
+		ChaosConfig:    chaos.NoChaos("BTC-MED"),
+		ReplayOrders:   orders,
+		Klines:         klines,
+		Sink:           sink,
+		InitialBalance: types.QtyFromFloat(10_000),
+		PlayerAddress:  "player1",
+	}
+	a, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	// Manually craft a thin-margin position before Run starts.
+	acc := a.Account("player1")
+	if acc == nil {
+		t.Fatal("account missing")
+	}
+	acc.Positions["BTC-MED"] = &account.Position{
+		Symbol:   "BTC-MED",
+		Side:     types.SideBuy,
+		Size:     types.QtyFromFloat(0.5),
+		AvgEntry: types.PriceFromFloat(8000),
+		Margin:   types.QtyFromFloat(50), // ~80x leverage equivalent
+	}
+	acc.Balance -= types.QtyFromFloat(50)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := a.Run(ctx); err != nil && err != context.Canceled {
+		t.Fatalf("Run: %v", err)
+	}
+
+	liq := countByTypeAct(sink.Events, types.EventLiquidation)
+	if liq < 1 {
+		t.Fatalf("expected ≥1 liquidation event, got %d", liq)
+	}
+	// After liquidation the position must be removed.
+	if pos, ok := acc.Positions["BTC-MED"]; ok && pos.Size > 0 {
+		t.Errorf("position still open after liquidation: size=%s", pos.Size)
+	}
+	// Insurance fund should have moved (either down due to loss, or unchanged
+	// if the position salvaged).
+	t.Logf("insurance fund after: %s", a.InsuranceFund())
+}
+
+// TestFundingApplied runs a 9-hour simulated window and verifies at least one
+// funding event was emitted (8h interval).
+func TestFundingApplied(t *testing.T) {
+	dur := 9 * time.Hour
+	orders := makeOrders(t, dur)
+	klines := makeKlines(t, dur)
+
+	sink := &MemorySink{}
+	cfg := Config{
+		Symbol:         "BTC-MED",
+		SessionID:      "funding",
+		LevelID:        "D-312-BTC",
+		ChaosConfig:    chaos.NoChaos("BTC-MED"),
+		ReplayOrders:   orders,
+		Klines:         klines,
+		Sink:           sink,
+		InitialBalance: types.QtyFromFloat(10_000),
+		PlayerAddress:  "player1",
+	}
+	a, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	if err := a.Run(ctx); err != nil && err != context.Canceled {
+		t.Fatalf("Run: %v", err)
+	}
+
+	fund := countByTypeAct(sink.Events, types.EventFunding)
+	if fund == 0 {
+		t.Errorf("expected ≥1 funding event in 9h window, got %d", fund)
+	}
+	t.Logf("funding events: %d", fund)
+}
+
+// TestInvariant_HoldsAfterReplay enables strict invariants and runs a short
+// window to confirm no invariant panics.
+func TestInvariant_HoldsAfterReplay(t *testing.T) {
+	dur := 10 * time.Minute
+	orders := makeOrders(t, dur)
+	klines := makeKlines(t, dur)
+
+	sink := &MemorySink{}
+	cfg := Config{
+		Symbol:           "BTC-MED",
+		SessionID:        "invariant",
+		LevelID:          "D-312-BTC",
+		ChaosConfig:      chaos.NoChaos("BTC-MED"),
+		ReplayOrders:     orders,
+		Klines:           klines,
+		Sink:             sink,
+		InitialBalance:   types.QtyFromFloat(10_000),
+		PlayerAddress:    "player1",
+		StrictInvariants: true,
+	}
+	a, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := a.Run(ctx); err != nil && err != context.Canceled {
+		t.Fatalf("Run: %v", err)
+	}
+}
+
+// TestChaosWick_InjectsTrades enables the BTC_MED_L2 chaos config and verifies
+// the actor produces some additional taker-sell trades from the wick injector.
+func TestChaosWick_InjectsTrades(t *testing.T) {
+	dur := 30 * time.Minute
+	orders := makeOrders(t, dur)
+	klines := makeKlines(t, dur)
+
+	// Force-enable wicks for the test by constructing a config with high prob.
+	cfg := chaos.Config{
+		Symbol:        "BTC-MED",
+		Seed:          1,
+		WickProb:      1.0, // every kline gets a wick
+		WickMagnitude: 0.05,
+		DepthShrink:   1.0, // disable depth shrink so we don't break market orders
+		OracleLagNS:   0,
+	}
+
+	sink := &MemorySink{}
+	acfg := Config{
+		Symbol:         "BTC-MED",
+		SessionID:      "wick",
+		LevelID:        "D-312-BTC",
+		ChaosConfig:    cfg,
+		ReplayOrders:   orders,
+		Klines:         klines,
+		Sink:           sink,
+		InitialBalance: types.QtyFromFloat(10_000),
+		PlayerAddress:  "player1",
+	}
+	a, err := New(acfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := a.Run(ctx); err != nil && err != context.Canceled {
+		t.Fatalf("Run: %v", err)
+	}
+
+	// Count trades whose taker owner is "chaos-wick"
+	wickTrades := 0
+	for _, e := range sink.Events {
+		if e.Type != types.EventTrade {
+			continue
+		}
+		var p types.TradePayload
+		_ = json.Unmarshal(e.Payload, &p)
+		if p.Trade.TakerOwner == "chaos-wick" {
+			wickTrades++
+		}
+	}
+	if wickTrades == 0 {
+		t.Errorf("expected ≥1 chaos-wick trade with WickProb=1, got 0")
+	}
+	t.Logf("chaos-wick trades: %d", wickTrades)
 }

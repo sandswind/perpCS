@@ -138,6 +138,21 @@ type fillMsg struct {
 	PnL     string `json:"pnl"`
 }
 
+// liquidationMsg is the payload for liquidation WS messages (account channel).
+type liquidationMsg struct {
+	Symbol    string `json:"symbol"`
+	Size      string `json:"size"`
+	MarkPrice string `json:"mark_price"`
+	Loss      string `json:"loss"`
+	TS        int64  `json:"ts"`
+}
+
+// fundingMsg is the payload for funding WS messages (broadcast to all accounts).
+type fundingMsg struct {
+	Rate float64 `json:"rate"`
+	TS   int64   `json:"ts"`
+}
+
 // Emit implements actor.EventSink. It fans out events to subscribers.
 // This method must not block — drops silently if a subscriber's buffer is full.
 func (f *Fanout) Emit(e types.Event) error {
@@ -146,6 +161,10 @@ func (f *Fanout) Emit(e types.Event) error {
 		return f.emitBookSnapshot(e)
 	case types.EventTrade:
 		return f.emitTrade(e)
+	case types.EventLiquidation:
+		return f.emitLiquidation(e)
+	case types.EventFunding:
+		return f.emitFunding(e)
 	}
 	return nil
 }
@@ -239,6 +258,62 @@ func (f *Fanout) broadcast(kind, key string, msg []byte) {
 			// buffer full — drop
 		}
 	}
+}
+
+// broadcastToAllAccounts sends msg to every account subscriber, regardless of
+// session ID. Used for global signals (e.g. funding settlement).
+func (f *Fanout) broadcastToAllAccounts(msg []byte) {
+	f.mu.RLock()
+	conns := make([]*Conn, 0)
+	for _, subs := range f.accountSubs {
+		for c := range subs {
+			conns = append(conns, c)
+		}
+	}
+	f.mu.RUnlock()
+	for _, c := range conns {
+		select {
+		case c.send <- msg:
+		default:
+		}
+	}
+}
+
+// emitLiquidation forwards a liquidation event to the subscribed account.
+func (f *Fanout) emitLiquidation(e types.Event) error {
+	var payload types.LiquidationPayload
+	if err := json.Unmarshal(e.Payload, &payload); err != nil {
+		return err
+	}
+	msg, err := makeMsg("liquidation", liquidationMsg{
+		Symbol:    string(payload.Symbol),
+		Size:      payload.Size.String(),
+		MarkPrice: payload.MarkPrice.String(),
+		Loss:      payload.Loss.String(),
+		TS:        payload.TS,
+	})
+	if err != nil {
+		return err
+	}
+	f.broadcast("account", payload.Address, msg)
+	return nil
+}
+
+// emitFunding broadcasts a funding event to every account subscriber.
+func (f *Fanout) emitFunding(e types.Event) error {
+	var payload types.FundingPayload
+	if err := json.Unmarshal(e.Payload, &payload); err != nil {
+		return err
+	}
+	msg, err := makeMsg("funding", fundingMsg{
+		Rate: payload.Rate,
+		TS:   payload.TS,
+	})
+	if err != nil {
+		return err
+	}
+	f.broadcastToAllAccounts(msg)
+	return nil
 }
 
 // ServeMarket returns an http.Handler that upgrades to WebSocket and streams
