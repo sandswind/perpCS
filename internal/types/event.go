@@ -16,6 +16,8 @@ const (
 	// v0.4 events
 	EventLiquidation EventType = "liquidation"
 	EventFunding     EventType = "funding"
+	// v0.6 events
+	EventSessionClose EventType = "session_close"
 )
 
 // Event is a tagged union written to the audit log. The Payload field
@@ -79,4 +81,12 @@ type LiquidationPayload struct {
 type FundingPayload struct {
 	Rate float64 `json:"rate"`
 	TS   int64   `json:"ts"`
+}
+
+// SessionClosePayload is emitted when a player's session is manually settled (v0.6).
+type SessionClosePayload struct {
+	Address     string `json:"address"`
+	SessionID   string `json:"session_id"`
+	FinalEquity Qty    `json:"final_equity"`
+	TS          int64  `json:"ts"`
 }

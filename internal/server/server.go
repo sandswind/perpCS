@@ -9,6 +9,12 @@
 //	GET  /ws/market/{symbol}    — WebSocket: orderbook snapshots + trades
 //	GET  /ws/account/{sid}      — WebSocket: fill + position updates for a session
 //
+// v0.6 routes:
+//
+//	POST /sessions/{addr}/close   — settle a session and compute final equity
+//	GET  /sessions/{addr}/receipt — return the signed WithdrawReceipt
+//	GET  /sessions/{addr}/report  — return the full debrief SessionReport
+//
 // Design rules:
 //   - All communication with the MarketActor goes through the OrderQueue channel.
 //   - No direct access to the OrderBook or Account — single-writer invariant preserved.
@@ -29,9 +35,18 @@ import (
 	"github.com/sandswind/perpCS/internal/account"
 	"github.com/sandswind/perpCS/internal/actor"
 	"github.com/sandswind/perpCS/internal/fanout"
+	"github.com/sandswind/perpCS/internal/reporting"
 	"github.com/sandswind/perpCS/internal/session"
 	"github.com/sandswind/perpCS/internal/types"
 )
+
+// reportingIface is the subset of reporting.Svc used by the HTTP layer.
+// Defined as an interface so it can be nil-checked and mocked in tests.
+type reportingIface interface {
+	LookupReceipt(player string) *reporting.WithdrawReceipt
+	LookupReport(player string) *reporting.SessionReport
+	Settle(res actor.CloseSessionResult, player string, nonce uint64, archivePath string) (*reporting.WithdrawReceipt, error)
+}
 
 // Server wraps the HTTP handler for the trading API.
 type Server struct {
@@ -47,6 +62,8 @@ type Server struct {
 	// the URL/query param of /account?address=0x... rather than the
 	// bootstrap account, so we can serve multi-player.
 	enableOnChain bool
+	// v0.6: optional reporting service for receipts + debrief reports.
+	reportingSvc reportingIface
 }
 
 // New creates a Server. queue must be the same channel passed to actor.Config.OrderQueue.
@@ -84,6 +101,12 @@ func (s *Server) WithSessions(svc *session.Svc) *Server {
 	return s
 }
 
+// WithReporting enables the v0.6 /sessions/{addr}/receipt and /report endpoints.
+func (s *Server) WithReporting(svc *reporting.Svc) *Server {
+	s.reportingSvc = svc
+	return s
+}
+
 // corsMiddleware allows requests from the Next.js dev server on localhost:3000.
 func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -111,6 +134,13 @@ func (s *Server) Handler() http.Handler {
 	if s.sessionSvc != nil {
 		mux.HandleFunc("GET /sessions/{addr}", s.handleGetSessionByAddress)
 		mux.HandleFunc("GET /sessions/by-id/{sid}", s.handleGetSessionByID)
+	}
+
+	// v0.6: settlement, receipt, and debrief report
+	if s.actor != nil {
+		mux.HandleFunc("POST /sessions/{addr}/close", s.handleCloseSession)
+		mux.HandleFunc("GET /sessions/{addr}/receipt", s.handleGetReceipt)
+		mux.HandleFunc("GET /sessions/{addr}/report", s.handleGetReport)
 	}
 
 	// WebSocket routes (v0.3)
@@ -430,6 +460,136 @@ func statusForReady(ready bool) int {
 		return http.StatusOK
 	}
 	return http.StatusAccepted // 202 — confirmed on chain, vAccount still being created
+}
+
+// ---- v0.6 handlers ----
+
+// handleCloseSession: POST /sessions/{addr}/close
+//
+// Triggers settlement of a player's session: forces all positions flat,
+// computes final equity, signs a WithdrawReceipt.
+//
+// If the session is already closed the existing receipt is returned (idempotent).
+func (s *Server) handleCloseSession(w http.ResponseWriter, r *http.Request) {
+	addr := strings.ToLower(strings.TrimSpace(r.PathValue("addr")))
+	if addr == "" {
+		writeError(w, http.StatusBadRequest, "missing address")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+
+	res, err := s.actor.CloseSession(ctx, addr)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("close session: %v", err))
+		return
+	}
+
+	// Settle via reporting service (produces signed receipt)
+	var receipt interface{}
+	if s.reportingSvc != nil {
+		rec, settleErr := s.reportingSvc.Settle(res, addr, 0, "")
+		if settleErr != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("settle: %v", settleErr))
+			return
+		}
+		receipt = rec
+	} else {
+		// No reporting svc: return bare finalEquity
+		receipt = map[string]interface{}{
+			"session_id":       res.SessionID,
+			"player":           addr,
+			"final_equity":     res.FinalEquity.String(),
+			"final_equity_raw": int64(res.FinalEquity),
+		}
+	}
+
+	writeJSON(w, http.StatusOK, receipt)
+}
+
+// handleGetReceipt: GET /sessions/{addr}/receipt
+//
+// Returns the signed WithdrawReceipt for a settled session.
+// 404 if the session hasn't been closed yet.
+func (s *Server) handleGetReceipt(w http.ResponseWriter, r *http.Request) {
+	addr := strings.ToLower(strings.TrimSpace(r.PathValue("addr")))
+	if addr == "" {
+		writeError(w, http.StatusBadRequest, "missing address")
+		return
+	}
+
+	// Check if there's a closed session on the actor
+	summary := s.actor.ClosedSession(addr)
+	if summary == nil {
+		writeError(w, http.StatusNotFound, "session not yet settled — POST /sessions/{addr}/close first")
+		return
+	}
+
+	// Return the reporting receipt if available
+	if s.reportingSvc != nil {
+		rec := s.reportingSvc.LookupReceipt(addr)
+		if rec != nil {
+			writeJSON(w, http.StatusOK, rec)
+			return
+		}
+		// Auto-settle if somehow the receipt is missing but summary exists
+		closeRes := actor.CloseSessionResult{
+			FinalEquity: summary.FinalEquity,
+			SessionID:   summary.SessionID,
+		}
+		rec, err := s.reportingSvc.Settle(closeRes, addr, 0, "")
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, rec)
+		return
+	}
+
+	// Bare receipt without reporting svc
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"session_id":       summary.SessionID,
+		"player":           addr,
+		"final_equity":     summary.FinalEquity.String(),
+		"final_equity_raw": int64(summary.FinalEquity),
+		"signature":        "",
+	})
+}
+
+// handleGetReport: GET /sessions/{addr}/report
+//
+// Returns the full SessionReport (PnL curve + debrief metrics).
+// 404 if the session hasn't been settled.
+func (s *Server) handleGetReport(w http.ResponseWriter, r *http.Request) {
+	addr := strings.ToLower(strings.TrimSpace(r.PathValue("addr")))
+	if addr == "" {
+		writeError(w, http.StatusBadRequest, "missing address")
+		return
+	}
+
+	summary := s.actor.ClosedSession(addr)
+	if summary == nil {
+		writeError(w, http.StatusNotFound, "session not yet settled")
+		return
+	}
+
+	if s.reportingSvc != nil {
+		rep := s.reportingSvc.LookupReport(addr)
+		if rep != nil {
+			writeJSON(w, http.StatusOK, rep)
+			return
+		}
+	}
+
+	// Fallback: minimal report from summary alone
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"session_id":   summary.SessionID,
+		"player":       addr,
+		"final_equity": summary.FinalEquity.String(),
+		"closed":       summary.Closed,
+		"pnl_curve":    []interface{}{},
+	})
 }
 
 // ---- helpers ----
