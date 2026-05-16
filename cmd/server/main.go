@@ -36,6 +36,7 @@ import (
 	"github.com/sandswind/perpCS/internal/chaos"
 	"github.com/sandswind/perpCS/internal/fanout"
 	"github.com/sandswind/perpCS/internal/provider"
+	"github.com/sandswind/perpCS/internal/reporting"
 	"github.com/sandswind/perpCS/internal/server"
 	"github.com/sandswind/perpCS/internal/session"
 	"github.com/sandswind/perpCS/internal/types"
@@ -67,6 +68,12 @@ func run() error {
 	chainStartBlock := flag.Uint64("chain-start-block", 0, "Indexer start block (0 → use deploy block from JSON)")
 	chainStatePath := flag.String("chain-state", "out/indexer-state.json", "Indexer state file path")
 	chainAuditPath := flag.String("chain-audit", "out/sessions.jsonl", "Session audit JSONL path")
+
+	// v0.6: reporting / receipt signing
+	signingKey := flag.String("signing-key", "", "32-byte hex ECDSA private key for receipt signing (optional)")
+	reportingChainID := flag.Uint64("reporting-chain-id", 421614, "chain ID embedded in EIP-712 domain (421614 = Arbitrum Sepolia)")
+	reportingVaultAddr := flag.String("reporting-vault", "", "GameVault contract address for EIP-712 domain")
+	reportingArchiveDir := flag.String("reporting-archive", "out/archive", "directory for session event archives")
 
 	flag.Parse()
 
@@ -173,6 +180,23 @@ func run() error {
 	// ---- HTTP server ----
 	acc := a.Account(*address)
 	srv := server.NewWithFanout(acc, queue, "BTC-MED", fo).WithActor(a)
+
+	// ---- v0.6: reporting service ----
+	reportSvc, err := reporting.New(reporting.Config{
+		SigningKeyHex: *signingKey,
+		ChainID:       *reportingChainID,
+		VaultAddress:  *reportingVaultAddr,
+		ArchiveDir:    *reportingArchiveDir,
+	})
+	if err != nil {
+		return fmt.Errorf("reporting svc: %w", err)
+	}
+	if reportSvc.SignerAddress() != "" {
+		fmt.Printf("[report] signer address: %s\n", reportSvc.SignerAddress())
+	} else {
+		fmt.Printf("[report] unsigned receipts (set --signing-key to enable EIP-712 signing)\n")
+	}
+	srv = srv.WithReporting(reportSvc)
 
 	// ---- v0.5: optional on-chain entry path ----
 	if *chainRPC != "" {

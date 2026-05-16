@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { WS_BASE } from '@/lib/config';
+import type { SessionCloseEvent } from '@/components/SessionEndModal';
 
 export interface Position {
   symbol: string;
@@ -35,7 +36,8 @@ export interface FundingEvent {
 
 interface WSEnvelope {
   type: string;
-  data: Position | Fill | LiquidationEvent | FundingEvent;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  data: any;
 }
 
 export function useAccountWS(sessionId: string) {
@@ -44,6 +46,7 @@ export function useAccountWS(sessionId: string) {
   const [liquidation, setLiquidation] = useState<LiquidationEvent | null>(null);
   const [fundingRate, setFundingRate] = useState<number | null>(null);
   const [lastFundingTS, setLastFundingTS] = useState<number | null>(null);
+  const [sessionClose, setSessionClose] = useState<SessionCloseEvent | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -68,6 +71,9 @@ export function useAccountWS(sessionId: string) {
           const f = envelope.data as FundingEvent;
           setFundingRate(f.rate);
           setLastFundingTS(f.ts);
+        } else if (envelope.type === 'session_close') {
+          // v0.6: replay ended → trigger settlement modal
+          setSessionClose(envelope.data as SessionCloseEvent);
         }
       } catch {
         // ignore
@@ -93,5 +99,5 @@ export function useAccountWS(sessionId: string) {
     };
   }, [connect]);
 
-  return { position, fills, liquidation, fundingRate, lastFundingTS };
+  return { position, fills, liquidation, fundingRate, lastFundingTS, sessionClose };
 }

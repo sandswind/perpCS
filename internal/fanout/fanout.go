@@ -165,6 +165,8 @@ func (f *Fanout) Emit(e types.Event) error {
 		return f.emitLiquidation(e)
 	case types.EventFunding:
 		return f.emitFunding(e)
+	case types.EventSessionClose:
+		return f.emitSessionClose(e)
 	}
 	return nil
 }
@@ -313,6 +315,32 @@ func (f *Fanout) emitFunding(e types.Event) error {
 		return err
 	}
 	f.broadcastToAllAccounts(msg)
+	return nil
+}
+
+// sessionCloseMsg is the WS payload for session_close events (account channel).
+type sessionCloseMsg struct {
+	SessionID   string `json:"session_id"`
+	FinalEquity string `json:"final_equity"`
+	TS          int64  `json:"ts"`
+}
+
+// emitSessionClose sends a session_close event to the player's account channel.
+func (f *Fanout) emitSessionClose(e types.Event) error {
+	var payload types.SessionClosePayload
+	if err := json.Unmarshal(e.Payload, &payload); err != nil {
+		return err
+	}
+	msg, err := makeMsg("session_close", sessionCloseMsg{
+		SessionID:   payload.SessionID,
+		FinalEquity: payload.FinalEquity.String(),
+		TS:          payload.TS,
+	})
+	if err != nil {
+		return err
+	}
+	// Broadcast to the specific player's account channel
+	f.broadcast("account", payload.Address, msg)
 	return nil
 }
 

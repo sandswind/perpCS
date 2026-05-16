@@ -15,16 +15,21 @@
 //	output to the EventSink. This is tested by the determinism regression test.
 //
 // v0.4 — Chaos & Liquidation pipeline (per tick, in order):
-//   1. emit TickAdvance
-//   2. ApplyWick (if this TS is a kline OpenTS): inject a chaos sell order
-//   3. Inject replay orders (limit → rest, market → match)
-//   4. Drain user-order queue
-//   5. Update mark price (chaos.MarkPrice with oracle lag)
-//   6. Mark-to-market all accounts
-//   7. Liquidation scan: any position with marginRatio ≤ MMR is force-closed
-//   8. Funding settlement (every 8h of simulated time)
-//   9. Build snapshot, apply depth shrink, emit
-//   10. (Optional) Strict-invariant self-check
+//  1. emit TickAdvance
+//  2. ApplyWick (if this TS is a kline OpenTS): inject a chaos sell order
+//  3. Inject replay orders (limit → rest, market → match)
+//  4. Drain user-order queue
+//  5. Update mark price (chaos.MarkPrice with oracle lag)
+//  6. Mark-to-market all accounts
+//  7. Liquidation scan: any position with marginRatio ≤ MMR is force-closed
+//  8. Funding settlement (every 8h of simulated time)
+//  9. Build snapshot, apply depth shrink, emit
+//  10. (Optional) Strict-invariant self-check
+//
+// v0.6 additions:
+//   - account.OpenOrders kept in sync (add on limit rest, remove on fill/cancel)
+//   - HasAccount routed through actor channel to eliminate data race
+//   - CloseSessionRequest channel for settlement trigger
 package actor
 
 import (
@@ -32,6 +37,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"sync"
 
 	"github.com/sandswind/perpCS/internal/account"
 	"github.com/sandswind/perpCS/internal/chaos"
@@ -89,6 +95,37 @@ type OpenSessionRequest struct {
 // OpenSessionResult mirrors the existing UserOrderResult pattern.
 type OpenSessionResult struct {
 	Err error
+}
+
+// HasAccountRequest asks the actor (on its goroutine) whether an address has
+// an account. Using a channel avoids the data race between the actor writer
+// and the HTTP handler reader.
+type HasAccountRequest struct {
+	Address  string
+	ResultCh chan bool
+}
+
+// CloseSessionRequest triggers settlement for a player's session.
+// The actor computes finalEquity, marks the session closed, and sends the
+// result back on ResultCh.
+type CloseSessionRequest struct {
+	Address  string
+	ResultCh chan CloseSessionResult
+}
+
+// CloseSessionResult is returned after the actor settles a session.
+type CloseSessionResult struct {
+	FinalEquity types.Qty
+	SessionID   string
+	Err         error
+}
+
+// SessionSummary holds post-settlement stats used by the Reporting Svc.
+type SessionSummary struct {
+	Address     string
+	SessionID   string
+	FinalEquity types.Qty
+	Closed      bool
 }
 
 // Config holds the parameters for one MarketActor session.
@@ -158,6 +195,15 @@ type Actor struct {
 
 	// v0.4 — chaos liquidation order ID space (separate from replay & user)
 	nextChaosID uint64
+
+	// v0.6 — closed sessions: address → SessionSummary
+	closedSessions map[string]*SessionSummary
+	// mu protects closedSessions for reads outside the actor goroutine.
+	mu sync.RWMutex
+
+	// v0.6 internal queues — created by New(), exposed via public methods
+	hasAccountQueue  chan *HasAccountRequest
+	closeSessionQueue chan *CloseSessionRequest
 }
 
 // New creates a new MarketActor. Call Run() to start the simulation.
@@ -179,17 +225,20 @@ func New(cfg Config) (*Actor, error) {
 		insurance = DefaultInsuranceFund
 	}
 	a := &Actor{
-		cfg:              cfg,
-		book:             orderbook.New(cfg.Symbol),
-		chaos:            chaos.New(cfg.ChaosConfig),
-		orders:           cfg.ReplayOrders,
-		accounts:         make(map[string]*account.Account),
-		nextUserID:       1_000_000_000,            // user IDs above replay IDs
-		nextChaosID:      2_000_000_000,            // chaos IDs above user IDs
-		klineByTS:        buildKlineIndex(cfg.Klines),
-		insuranceFund:    insurance,
-		fundingRates:     cfg.FundingRates,
-		strictInvariants: cfg.StrictInvariants,
+		cfg:               cfg,
+		book:              orderbook.New(cfg.Symbol),
+		chaos:             chaos.New(cfg.ChaosConfig),
+		orders:            cfg.ReplayOrders,
+		accounts:          make(map[string]*account.Account),
+		closedSessions:    make(map[string]*SessionSummary),
+		nextUserID:        1_000_000_000,            // user IDs above replay IDs
+		nextChaosID:       2_000_000_000,            // chaos IDs above user IDs
+		klineByTS:         buildKlineIndex(cfg.Klines),
+		insuranceFund:     insurance,
+		fundingRates:      cfg.FundingRates,
+		strictInvariants:  cfg.StrictInvariants,
+		hasAccountQueue:   make(chan *HasAccountRequest, 32),
+		closeSessionQueue: make(chan *CloseSessionRequest, 16),
 	}
 	// Create the default player account if balance is specified
 	if cfg.InitialBalance > 0 && cfg.PlayerAddress != "" {
@@ -220,22 +269,58 @@ func (a *Actor) Account(address string) *account.Account {
 }
 
 // HasAccount reports whether an account with the given address has been
-// created by either the bootstrap config or an OpenSession request.
-//
-// CONCURRENCY NOTE: this is intended for the post-startup lookup path where
-// the writer (actor goroutine) and the reader (HTTP handler) coordinate via
-// the same map without a mutex. In v0.5 the read happens after a 5-block
-// confirmation delay (~7s on Arbitrum Sepolia), which is long after the
-// corresponding write — making a torn read effectively impossible. We
-// nevertheless mark this as a known v0.6 cleanup target (push lookup through
-// the actor goroutine via a request channel).
+// created. v0.6: routes through HasAccountQueue to eliminate data race.
+// Falls back to direct map read if channel is nil (safe after Run() exits).
 func (a *Actor) HasAccount(address string) bool {
-	_, ok := a.accounts[address]
-	return ok
+	if a.hasAccountQueue == nil {
+		_, ok := a.accounts[address]
+		return ok
+	}
+	req := &HasAccountRequest{
+		Address:  address,
+		ResultCh: make(chan bool, 1),
+	}
+	select {
+	case a.hasAccountQueue <- req:
+		return <-req.ResultCh
+	default:
+		// Channel full — best-effort direct read
+		_, ok := a.accounts[address]
+		return ok
+	}
 }
 
 // InsuranceFund returns the current insurance fund balance (read after Run).
 func (a *Actor) InsuranceFund() types.Qty { return a.insuranceFund }
+
+// CloseSession sends a settlement request to the actor goroutine.
+// It blocks until the actor processes the request (max 5s) or ctx is done.
+// Use this to trigger end-of-session settlement from the HTTP layer.
+func (a *Actor) CloseSession(ctx context.Context, address string) (CloseSessionResult, error) {
+	req := &CloseSessionRequest{
+		Address:  address,
+		ResultCh: make(chan CloseSessionResult, 1),
+	}
+	select {
+	case a.closeSessionQueue <- req:
+	case <-ctx.Done():
+		return CloseSessionResult{}, ctx.Err()
+	}
+	select {
+	case res := <-req.ResultCh:
+		return res, res.Err
+	case <-ctx.Done():
+		return CloseSessionResult{}, ctx.Err()
+	}
+}
+
+// ClosedSession returns the SessionSummary for a settled session, or nil.
+// Safe to call from any goroutine (protected by RWMutex).
+func (a *Actor) ClosedSession(address string) *SessionSummary {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.closedSessions[address]
+}
 
 // Run executes the replay loop. See package doc for the per-tick sequence.
 //
@@ -269,35 +354,54 @@ func (a *Actor) Run(ctx context.Context) error {
 		}
 	}
 
-	// After all replay ticks, keep processing user orders until ctx is done
-	if a.cfg.OrderQueue != nil || a.cfg.SessionQueue != nil {
-		for {
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case uord, ok := <-a.cfg.OrderQueue:
-				if !ok {
-					goto runDone
-				}
-				if uord.CancelOrderID != 0 {
-					err := a.book.Cancel(uord.CancelOrderID)
-					uord.ResultCh <- UserOrderResult{Err: err}
-				} else {
-					trades, err := a.processUserOrder(uord.Order, lastTS)
-					uord.ResultCh <- UserOrderResult{Trades: trades, Err: err}
-				}
-			case sreq, ok := <-a.cfg.SessionQueue:
-				if !ok {
-					goto runDone
-				}
-				err := a.openSession(sreq)
-				if sreq.ResultCh != nil {
-					sreq.ResultCh <- OpenSessionResult{Err: err}
-				}
+	// After all replay ticks, keep processing user/session/control requests until ctx is done.
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case uord, ok := <-a.cfg.OrderQueue:
+			if !ok {
+				goto runDone
 			}
+			if uord.CancelOrderID != 0 {
+				err := a.book.Cancel(uord.CancelOrderID)
+				// Remove from open orders on cancel.
+				for _, acc := range a.accounts {
+					delete(acc.OpenOrders, uord.CancelOrderID)
+				}
+				uord.ResultCh <- UserOrderResult{Err: err}
+			} else {
+				trades, err := a.processUserOrder(uord.Order, lastTS)
+				uord.ResultCh <- UserOrderResult{Trades: trades, Err: err}
+			}
+		case sreq, ok := <-a.cfg.SessionQueue:
+			if !ok {
+				goto runDone
+			}
+			err := a.openSession(sreq)
+			if sreq.ResultCh != nil {
+				sreq.ResultCh <- OpenSessionResult{Err: err}
+			}
+		case hreq := <-a.hasAccountQueue:
+			_, ok := a.accounts[hreq.Address]
+			hreq.ResultCh <- ok
+		case creq := <-a.closeSessionQueue:
+			res := a.processCloseSession(creq.Address, lastTS)
+			creq.ResultCh <- res
 		}
 	}
 runDone:
+
+	// v0.6: auto-settle all accounts when replay ends.
+	for addr := range a.accounts {
+		a.mu.RLock()
+		_, alreadyClosed := a.closedSessions[addr]
+		a.mu.RUnlock()
+		if !alreadyClosed {
+			res := a.processCloseSession(addr, lastTS)
+			_ = res // errors logged inside processCloseSession
+		}
+	}
 
 	return a.emitSessionEnd(lastTS)
 }
@@ -332,6 +436,8 @@ func (a *Actor) processTick(ts int64, tick []*types.Order) error {
 	// 4. Drain user order queue (non-blocking)
 	a.drainUserQueue(ts)
 	a.drainSessionQueue()
+	a.drainHasAccountQueue()
+	a.drainCloseSessionQueue(ts)
 
 	// 5. Mark price (with oracle lag) — ALWAYS advance the chaos buffer so
 	// MarkPrice() returns deterministic lagged values regardless of book state.
@@ -385,6 +491,10 @@ func (a *Actor) drainUserQueue(ts int64) {
 			}
 			if uord.CancelOrderID != 0 {
 				err := a.book.Cancel(uord.CancelOrderID)
+				// Keep OpenOrders in sync on cancel
+				for _, acc := range a.accounts {
+					delete(acc.OpenOrders, uord.CancelOrderID)
+				}
 				uord.ResultCh <- UserOrderResult{Err: err}
 			} else {
 				trades, err := a.processUserOrder(uord.Order, ts)
@@ -416,6 +526,93 @@ func (a *Actor) drainSessionQueue() {
 			return
 		}
 	}
+}
+
+// drainHasAccountQueue answers any pending HasAccount lookups. Non-blocking.
+func (a *Actor) drainHasAccountQueue() {
+	for {
+		select {
+		case req := <-a.hasAccountQueue:
+			_, ok := a.accounts[req.Address]
+			req.ResultCh <- ok
+		default:
+			return
+		}
+	}
+}
+
+// drainCloseSessionQueue processes any pending settlement requests. Non-blocking.
+func (a *Actor) drainCloseSessionQueue(ts int64) {
+	for {
+		select {
+		case req := <-a.closeSessionQueue:
+			res := a.processCloseSession(req.Address, ts)
+			req.ResultCh <- res
+		default:
+			return
+		}
+	}
+}
+
+// processCloseSession settles an account: forces all positions closed at
+// mark price, computes finalEquity, and records the SessionSummary.
+func (a *Actor) processCloseSession(address string, ts int64) CloseSessionResult {
+	acc, ok := a.accounts[address]
+	if !ok {
+		return CloseSessionResult{Err: fmt.Errorf("no account for %s", address)}
+	}
+
+	// Check already closed
+	a.mu.RLock()
+	if s, exists := a.closedSessions[address]; exists {
+		a.mu.RUnlock()
+		return CloseSessionResult{FinalEquity: s.FinalEquity, SessionID: s.SessionID}
+	}
+	a.mu.RUnlock()
+
+	// Force-close all open positions at current mark price
+	markPrice := a.bestMarkPrice()
+	for sym := range acc.Positions {
+		acc.MarkToMarket(sym, markPrice)
+		size, loss := acc.Liquidate(sym)
+		if size > 0 {
+			a.insuranceFund -= loss
+		}
+	}
+
+	// Cancel all resting limit orders, returning notional to balance
+	for id, o := range acc.OpenOrders {
+		// Return margin-equivalent for the unfilled portion: unfilled * price * leverage(=1)
+		notional := types.Qty(types.Notional(o.Price, o.Remaining()))
+		if notional < 0 {
+			notional = -notional
+		}
+		acc.Balance += notional
+		_ = a.book.Cancel(id)
+	}
+	acc.OpenOrders = make(map[types.OrderID]*types.Order)
+
+	finalEquity := acc.Balance
+
+	summary := &SessionSummary{
+		Address:     address,
+		SessionID:   acc.SessionID,
+		FinalEquity: finalEquity,
+		Closed:      true,
+	}
+	a.mu.Lock()
+	a.closedSessions[address] = summary
+	a.mu.Unlock()
+
+	// Emit a session_end-like event for the address
+	_ = a.emit(types.EventSessionClose, types.SessionClosePayload{
+		Address:     address,
+		SessionID:   acc.SessionID,
+		FinalEquity: finalEquity,
+		TS:          ts,
+	})
+
+	return CloseSessionResult{FinalEquity: finalEquity, SessionID: acc.SessionID}
 }
 
 // openSession creates a fresh vAccount on the actor goroutine. It is a no-op
@@ -668,6 +865,26 @@ func (a *Actor) processUserOrder(o *types.Order, ts int64) ([]types.Trade, error
 		_ = balanceBefore
 		// Update UPnL after fills
 		acc.MarkToMarket(o.Symbol, markPrice)
+
+		// v0.6: maintain OpenOrders — add limit order if not fully filled
+		if o.Type == types.OrderTypeLimit && !o.IsFullyFilled() {
+			acc.OpenOrders[o.ID] = o
+		}
+		// Remove from OpenOrders if now fully filled (can happen for crossing limits)
+		if o.IsFullyFilled() {
+			delete(acc.OpenOrders, o.ID)
+		}
+		// Also remove maker orders that were fully filled during matching
+		for _, t := range trades {
+			if t.MakerOwner == acc.Address {
+				makerID := t.MakerID
+				if makerO, exists := acc.OpenOrders[makerID]; exists {
+					if makerO.IsFullyFilled() {
+						delete(acc.OpenOrders, makerID)
+					}
+				}
+			}
+		}
 	}
 
 	// Emit events for user order trades
