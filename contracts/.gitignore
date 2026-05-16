@@ -1,0 +1,11 @@
+# Foundry
+out/
+cache/
+broadcast/
+
+# Coverage
+lcov.info
+
+# Local env (keep .env.example tracked)
+.env
+.env.local
